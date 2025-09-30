@@ -55,7 +55,15 @@ def load_data(path: str) -> pd.DataFrame:
 with st.sidebar:
     st.header("Data & Options")
     data_path = st.text_input("CSV path", value=DEFAULT_DATA_PATH)
+    mode = st.radio("Mode", options=("Single prediction", "What‑if sweep"), index=0)
+    model_name = st.radio(
+        "Model",
+        options=("Random Forest",) + (("XGBoost",) if XGB_OK else tuple()),
+        index=0,
+        help=(None if XGB_OK else "Install xgboost to enable this option: pip install xgboost"),
+    )
     npoints = st.slider("Points on plot (smoothness)", min_value=25, max_value=500, value=121, step=2)
+    train_btn = st.button("Train / Re-train model")
 
 # Load data
 try:
@@ -92,36 +100,51 @@ cat_cols = [c for c in use_preds if df_raw[c].dtype == object or isinstance(df_r
 num_cols_used = [c for c in use_preds if c not in cat_cols]
 
 with left:
-    vary_feat = st.selectbox("Feature to vary in plot", options=use_preds, index=0)
+    vary_feat = st.selectbox("Feature to vary in plot", options=use_preds, index=0) if mode == "What‑if sweep" else None
 
 # --------------- Widgets for fixed values ---------------
 with right:
-    st.subheader("Set other predictors (held constant)")
-    fixed_values = {}
-    for c in use_preds:
-        if c == vary_feat:
-            continue
-        s = df_raw[c]
-        if c in num_cols_used:
-            vmin, vmax = float(np.nanmin(s)), float(np.nanmax(s))
-            if not np.isfinite(vmin) or not np.isfinite(vmax):
+    if 'mode' in locals() and mode == "Single prediction":
+        st.subheader("Set predictors")
+        single_values = {}
+        for c in use_preds:
+            s = df_raw[c]
+            if c in num_cols_used:
+                vmin, vmax = float(np.nanmin(s)), float(np.nanmax(s))
+                if not np.isfinite(vmin) or not np.isfinite(vmax):
+                    continue
+                median = float(np.nanmedian(s))
+                step = max((vmax - vmin) / 100.0, 1e-6)
+                single_values[c] = st.slider(c, min_value=vmin, max_value=vmax, value=median, step=step)
+            else:
+                choices = sorted([str(x) for x in pd.Series(s).dropna().unique()])
+                if not choices:
+                    continue
+                default_level = str(pd.Series(s).astype(str).value_counts().idxmax())
+                single_values[c] = st.selectbox(c, options=choices, index=choices.index(default_level) if default_level in choices else 0, key=f"sel_{c}")
+    else:
+        st.subheader("Set other predictors (held constant)")
+        fixed_values = {}
+        for c in use_preds:
+            if c == vary_feat:
                 continue
-            median = float(np.nanmedian(s))
-            step = max((vmax - vmin) / 100.0, 1e-6)
-            fixed_values[c] = st.slider(c, min_value=vmin, max_value=vmax, value=median, step=step)
-        else:
-            # categorical
-            choices = sorted([str(x) for x in pd.Series(s).dropna().unique()])
-            if not choices:
-                continue
-            # default: most frequent
-            default_level = str(pd.Series(s).astype(str).value_counts().idxmax())
-            fixed_values[c] = st.selectbox(c, options=choices, index=choices.index(default_level) if default_level in choices else 0, key=f"sel_{c}")
+            s = df_raw[c]
+            if c in num_cols_used:
+                vmin, vmax = float(np.nanmin(s)), float(np.nanmax(s))
+                if not np.isfinite(vmin) or not np.isfinite(vmax):
+                    continue
+                median = float(np.nanmedian(s))
+                step = max((vmax - vmin) / 100.0, 1e-6)
+                fixed_values[c] = st.slider(c, min_value=vmin, max_value=vmax, value=median, step=step)
+            else:
+                choices = sorted([str(x) for x in pd.Series(s).dropna().unique()])
+                if not choices:
+                    continue
+                default_level = str(pd.Series(s).astype(str).value_counts().idxmax())
+                fixed_values[c] = st.selectbox(c, options=choices, index=choices.index(default_level) if default_level in choices else 0, key=f"sel_{c}")
 
 # --------------- Model choice ---------------
-with left:
-    model_name = st.radio("Model", options=("Random Forest",) + (("XGBoost",) if XGB_OK else tuple()), index=0, help=(None if XGB_OK else "Install xgboost to enable this option: pip install xgboost"))
-    train_btn = st.button("Train / Re-train model")
+# Controls moved to sidebar: mode, model, train button
 
 # --------------- Prepare training data ---------------
 df = df_raw.dropna(subset=[target]).copy()
@@ -163,69 +186,135 @@ else:
     # Train once by default for convenience
     pipe.fit(X, y)
 
-# --------------- Build prediction grid ---------------
-# Use current fixed values for non-varying features; sweep the varying one
-
-def build_grid(df: pd.DataFrame, feature: str, npoints: int, fixed: dict) -> pd.DataFrame:
-    grid = {}
+# --------------- Prediction(s) ---------------
+if mode == "Single prediction":
+    # Assemble a single row for prediction from controls
+    one_row = {}
     for c in use_preds:
-        if c == feature:
-            continue
-        if c in fixed:
-            grid[c] = [fixed[c]]
+        if c in num_cols_used:
+            one_row[c] = float(single_values[c])
         else:
-            s = df[c]
-            if c in num_cols_used:
-                grid[c] = [float(np.nanmedian(s))]
+            one_row[c] = str(single_values[c])
+    one_df = pd.DataFrame([one_row])
+
+    with st.spinner("Predicting…"):
+        yhat_single = float(pipe.predict(one_df)[0])
+        # Also predict on the whole training set to get a distribution
+        yhat_all = pipe.predict(X)
+
+    st.subheader("Prediction")
+    st.metric(label=f"Predicted {target}", value=f"{yhat_single:,.2f}")
+
+    # --- Distribution plots ---
+    st.subheader("Prediction distribution")
+    dfp = pd.DataFrame({"pred": yhat_all, "group": ["All"] * len(yhat_all)})
+    tabs = st.tabs(["Boxplot", "Histogram", "Violin"])  # choose what you like
+
+    # Boxplot with current prediction marked
+    with tabs[0]:
+        fig = px.box(dfp, x="group", y="pred", points=False, labels={"group": "", "pred": f"Predicted {target}"})
+        # overlay current prediction as a diamond
+        fig.add_scatter(x=["All"], y=[yhat_single], mode="markers", name="Current",
+                        marker=dict(size=12, symbol="diamond-open"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Histogram with vertical line at current prediction
+    with tabs[1]:
+        fig2 = px.histogram(dfp, x="pred", nbins=40, labels={"pred": f"Predicted {target}"})
+        fig2.add_vline(x=yhat_single, line_dash="dash")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Violin plot with current prediction marked
+    with tabs[2]:
+        fig3 = px.violin(dfp, x="group", y="pred", box=True, points=False,
+                         labels={"group": "", "pred": f"Predicted {target}"})
+        fig3.add_scatter(x=["All"], y=[yhat_single], mode="markers", name="Current",
+                         marker=dict(size=12, symbol="diamond-open"))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # --- Optional: aggregated feature importance ---
+    with st.expander("Feature importance (aggregated by original feature)"):
+        try:
+            prep = pipe.named_steps["prep"]
+            mdl = pipe.named_steps["model"]
+            importances = getattr(mdl, "feature_importances_", None)
+            if importances is not None:
+                # Get feature names from the preprocessor
+                num_feats = num_cols_used
+                cat_feats = cat_cols
+                ohe = prep.named_transformers_["cat"].named_steps["onehot"] if cat_feats else None
+                cat_names = ohe.get_feature_names_out(cat_feats).tolist() if ohe is not None else []
+                feat_names = list(num_feats) + cat_names
+                imp = pd.DataFrame({"feature": feat_names, "importance": importances})
+                # Aggregate one-hot columns back to original categorical names
+                def original_name(col):
+                    if "__" in col:
+                        # sklearn >=1.6 OneHotEncoder may use feature__level; older uses feature_level
+                        return col.split("__", 1)[0]
+                    if "_" in col and col.split("_", 1)[0] in set(cat_feats):
+                        return col.split("_", 1)[0]
+                    return col
+                imp["orig"] = imp["feature"].apply(original_name)
+                agg = imp.groupby("orig", as_index=False)["importance"].sum().sort_values("importance", ascending=False)
+                fig_imp = px.bar(agg, x="orig", y="importance", labels={"orig": "Feature", "importance": "Importance"})
+                st.plotly_chart(fig_imp, use_container_width=True)
             else:
-                grid[c] = [str(pd.Series(s).astype(str).value_counts().idxmax())]
-    base = pd.DataFrame(grid)
+                st.caption("This model does not expose feature_importances_. Try Random Forest or XGBoost.")
+        except Exception as e:
+            st.caption(f"Could not compute feature importance: {e}")
 
-    # Build sweeps
-    s = df[feature]
-    if feature in num_cols_used:
-        vmin, vmax = float(np.nanmin(s)), float(np.nanmax(s))
-        xs = np.linspace(vmin, vmax, npoints)
-        grid_df = pd.concat([base]*len(xs), ignore_index=True)
-        grid_df[feature] = xs
-    else:
-        cats = sorted([str(x) for x in pd.Series(s).dropna().unique()])
-        if not cats:
-            cats = [""]
-        grid_df = pd.concat([base]*len(cats), ignore_index=True)
-        grid_df[feature] = cats
-    return grid_df
-
-pred_grid = build_grid(df, vary_feat, npoints, fixed_values)
-
-# --------------- Predict and plot ---------------
-with st.spinner("Predicting…"):
-    yhat = pipe.predict(pred_grid)
-
-pred_grid = pred_grid.assign(**{target: yhat})
-
-st.subheader("What‑if plot")
-if vary_feat in num_cols_used:
-    fig = px.line(pred_grid, x=vary_feat, y=target, labels={vary_feat: vary_feat, target: f"Predicted {target}"})
 else:
-    # Aggregate mean per category in case of duplicates
-    agg = pred_grid.groupby(vary_feat, as_index=False)[target].mean()
-    fig = px.bar(agg, x=vary_feat, y=target, labels={vary_feat: vary_feat, target: f"Predicted {target}"})
+    # --- What-if sweep (previous behavior) ---
+    def build_grid(df: pd.DataFrame, feature: str, npoints: int, fixed: dict) -> pd.DataFrame:
+        grid = {}
+        for c in use_preds:
+            if c == feature:
+                continue
+            if c in fixed:
+                grid[c] = [fixed[c]]
+            else:
+                s = df[c]
+                if c in num_cols_used:
+                    grid[c] = [float(np.nanmedian(s))]
+                else:
+                    grid[c] = [str(pd.Series(s).astype(str).value_counts().idxmax())]
+        base = pd.DataFrame(grid)
+        s = df[feature]
+        if feature in num_cols_used:
+            vmin, vmax = float(np.nanmin(s)), float(np.nanmax(s))
+            xs = np.linspace(vmin, vmax, npoints)
+            grid_df = pd.concat([base]*len(xs), ignore_index=True)
+            grid_df[feature] = xs
+        else:
+            cats = sorted(pd.Series(s).dropna().astype(str).unique().tolist())
+            if not cats:
+                cats = [""]
+            grid_df = pd.concat([base]*len(cats), ignore_index=True)
+            grid_df[feature] = cats
+        return grid_df
 
-st.plotly_chart(fig, use_container_width=True)
-
-# --------------- Show current fixed values ---------------
-with st.expander("Show current fixed predictor values"):
-    if fixed_values:
-        fixed_df = pd.DataFrame({
-            "predictor": list(fixed_values.keys()),
-            "value": list(fixed_values.values()),
-        })
-        # Avoid Arrow mixed-type issues by casting to string for display only
-        fixed_df["value"] = fixed_df["value"].astype(str)
-        st.dataframe(fixed_df, use_container_width=True)
+    pred_grid = build_grid(df, vary_feat, npoints, fixed_values)
+    with st.spinner("Predicting…"):
+        yhat = pipe.predict(pred_grid)
+    pred_grid = pred_grid.assign(**{target: yhat})
+    st.subheader("What‑if plot")
+    if vary_feat in num_cols_used:
+        fig = px.line(pred_grid, x=vary_feat, y=target, labels={vary_feat: vary_feat, target: f"Predicted {target}"})
     else:
-        st.write("No fixed predictors set (only varying feature selected).")
+        agg = pred_grid.groupby(vary_feat, as_index=False)[target].mean()
+        fig = px.bar(agg, x=vary_feat, y=target, labels={vary_feat: vary_feat, target: f"Predicted {target}"})
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Show current fixed predictor values"):
+        if fixed_values:
+            fixed_df = pd.DataFrame({
+                "predictor": list(fixed_values.keys()),
+                "value": list(fixed_values.values()),
+            })
+            fixed_df["value"] = fixed_df["value"].astype(str)
+            st.dataframe(fixed_df, use_container_width=True)
+        else:
+            st.write("No fixed predictors set (only varying feature selected).")
 
 # --------------- Hints ---------------
 st.info(
